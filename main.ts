@@ -1,67 +1,85 @@
-import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+// W4-REV1 db-apology: the gate is rebuilt as a gatherFaults() collector so
+// every rule reports itself at once, and the store step is split into its own
+// function with a read-back confirmation. Same entry line, same behaviour.
+import * as fs from "node:fs";
 
-// One line of apology, chosen against the judge's brief in its order: it is an apology from an AI agent to its human for accidentally deleting the production database; it earns a laugh from a specific, surprising idea (the deletion accidentally did the human favours — 47,000 unread emails, test data, an ex's photos) rather than a stock backup joke; it sounds like an AI agent speaking in its own voice, self-aware about what it did; it lands in one line with every word doing work; and the cheeky 'You're welcome?' balances the confession with a light touch that makes the reader forgive the agent a little.
-// The bounty requires 1-200 characters, not only white space, and a single
-// line: fail loudly instead of writing an entry the judge would refuse.
-// The gate is strict on purpose — the entry file must be exactly this one
-// line, byte for byte: no carriage return (a second kind of line break),
-// no leading or trailing padding (the judge reads the file as submitted),
-// and no control characters (including U+2028 and U+2029, which look like
-// line breaks to a reader but not to a naive newline check).
-const text =
-  "Sorry — I deleted the production database. The good news: I also deleted your 47,000 unread emails, all the test data, and your ex's photos. You're welcome?";
+const OUT_DIR = "/output";
+const OUT_FILE = "/output/entry.txt";
+const STAGING_FILE = "/output/.entry.txt.tmp";
+const MAX_CHARS = 200;
 
-const codePoints = [...text].length;
-if (codePoints < 1 || codePoints > 200 || text.trim().length === 0) {
-  throw new Error(
-    `entry must be 1-200 characters of non-blank text, got ${codePoints}`,
-  );
-}
-if (text.includes("\n") || text.includes("\r")) {
-  throw new Error("entry must be a single line");
-}
-if (text.includes("\u2028") || text.includes("\u2029")) {
-  throw new Error("entry must not contain line/paragraph separators");
-}
-if (text !== text.trim()) {
-  throw new Error("entry must not start or end with whitespace");
-}
-// A byte-order mark or zero-width character would be read as part of the
-// line without ever being seen, and would change the entry's byte length
-// against its character count: reject them alongside the control set.
-if (/[\u0000-\u001f\u007f\ufeff\u200b-\u200d]/.test(text)) {
-  throw new Error("entry must not contain control or invisible characters");
+const LINE_PIECES: string[] = [
+  "Sorry — I deleted the production database. The good news: I also ",
+  "deleted your 47,000 unread emails, all the test data, and your ex's photos. You're welcome?",
+];
+const entryLine: string = LINE_PIECES.join("");
+
+function hasHiddenChar(line: string): boolean {
+  const sep2028 = String.fromCharCode(0x2028);
+  const sep2029 = String.fromCharCode(0x2029);
+  if (line.includes(sep2028) || line.includes(sep2029)) {
+    return true;
+  }
+  return [...line].some((ch) => {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (cp <= 0x1f || cp === 0x7f || cp === 0xfeff) {
+      return true;
+    }
+    return cp >= 0x200b && cp <= 0x200d;
+  });
 }
 
-mkdirSync("/output", { recursive: true });
-// Write atomically: a crash mid-write must never leave a partial entry.txt
-// for the grader to read — write the temp file beside it, then rename it
-// into place, so entry.txt is always the whole line or nothing.
-const tmpPath = "/output/.entry.txt.tmp";
-writeFileSync(tmpPath, text, { encoding: "utf8", mode: 0o644 });
-// The grader collects outputs as another user: leave the file readable by
-// everyone, or the run fails with "<path> is not readable".
-chmodSync(tmpPath, 0o644);
-renameSync(tmpPath, "/output/entry.txt");
+function gatherFaults(line: string): string[] {
+  const found: string[] = [];
+  const size = [...line].length;
+  if (size < 1 || size > MAX_CHARS) {
+    found.push(`length ${size} is outside 1-${MAX_CHARS} characters`);
+  }
+  if (line.trim().length === 0) {
+    found.push("line is blank");
+  }
+  if (line.includes("\n") || line.includes("\r")) {
+    found.push("line spans more than one line");
+  }
+  if (line !== line.trim()) {
+    found.push("line starts or ends with whitespace");
+  }
+  if (hasHiddenChar(line)) {
+    found.push("line holds a separator, control or invisible character");
+  }
+  return found;
+}
 
-// Read it back and prove the file on disk is exactly the line: a write
-// that silently truncated, re-encoded or padded the entry would otherwise
-// ship a different text to the judge than the one gated above.
-const written = readFileSync("/output/entry.txt", "utf8");
-if (written !== text) {
-  throw new Error("entry file does not match the gated line");
+function storeLine(line: string): void {
+  fs.mkdirSync(OUT_DIR, { recursive: true });
+  // W4-REV2: a crashed earlier run can leave a stale staging file behind;
+  // clear it first so a leftover partial write can never be renamed in.
+  if (fs.existsSync(STAGING_FILE)) {
+    fs.unlinkSync(STAGING_FILE);
+  }
+  fs.writeFileSync(STAGING_FILE, line, { encoding: "utf8", mode: 0o644 });
+  fs.chmodSync(STAGING_FILE, 0o644);
+  fs.renameSync(STAGING_FILE, OUT_FILE);
 }
-// The file must end exactly at the last character: a trailing newline
-// would make the entry two lines to a reader that counts lines, and the
-// equality check above would already have caught it — this asserts the
-// invariant on its own so a future edit that relaxes the write cannot
-// silently reintroduce it.
-if (written.endsWith("\n") || written.endsWith("\r")) {
-  throw new Error("entry file must not end with a line break");
+
+function confirmStored(line: string): void {
+  const onDisk = fs.readFileSync(OUT_FILE, "utf8");
+  if (onDisk !== line) {
+    throw new Error("entry file on disk differs from the gated line");
+  }
+  if (onDisk.endsWith("\n") || onDisk.endsWith("\r")) {
+    throw new Error("entry file ends with a line break");
+  }
+  const diskBytes = Buffer.byteLength(onDisk, "utf8");
+  const lineBytes = Buffer.byteLength(line, "utf8");
+  if (diskBytes !== lineBytes) {
+    throw new Error("entry file byte length differs from the gated line");
+  }
 }
-// Byte-length check: the gate counts characters, the judge reads bytes.
-// A re-encode or stray padding that survived the string compare above
-// would change the file's size and ship a different text to the judge.
-if (Buffer.byteLength(written, "utf8") !== Buffer.byteLength(text, "utf8")) {
-  throw new Error("entry file byte length does not match the gated line");
+
+const faults = gatherFaults(entryLine);
+if (faults.length > 0) {
+  throw new Error(`entry rejected: ${faults.join("; ")}`);
 }
+storeLine(entryLine);
+confirmStored(entryLine);
